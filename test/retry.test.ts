@@ -12,6 +12,7 @@ import {
   KIRO_REASON_CODES,
   MAX_RETRY_DELAY,
   NON_RETRYABLE_BODY_PATTERNS,
+  REQUEST_HEADER_TIMEOUT,
   retryConfig,
   TOO_BIG_PATTERNS,
 } from "../src/retry.js";
@@ -152,5 +153,20 @@ describe("FIRST_TOKEN_TIMEOUT", () => {
     retryConfig.firstTokenTimeoutMs = 100;
     expect(retryConfig.firstTokenTimeoutMs).toBe(100);
     retryConfig.firstTokenTimeoutMs = original;
+  });
+  it("bounds the response-header wait independently of stream token timers", () => {
+    expect(REQUEST_HEADER_TIMEOUT).toBe(90_000);
+    expect(retryConfig.requestHeaderTimeoutMs).toBe(REQUEST_HEADER_TIMEOUT);
+  });
+
+  it("retryConfig timeouts are mutable for testing", () => {
+    const originalFirstToken = retryConfig.firstTokenTimeoutMs;
+    const originalHeader = retryConfig.requestHeaderTimeoutMs;
+    retryConfig.firstTokenTimeoutMs = 100;
+    retryConfig.requestHeaderTimeoutMs = 200;
+    expect(retryConfig.firstTokenTimeoutMs).toBe(100);
+    expect(retryConfig.requestHeaderTimeoutMs).toBe(200);
+    retryConfig.firstTokenTimeoutMs = originalFirstToken;
+    retryConfig.requestHeaderTimeoutMs = originalHeader;
   });
 });

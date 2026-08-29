@@ -55,6 +55,7 @@ import {
   isNonRetryableBodyError,
   isTooBigError,
   MAX_RETRY_DELAY,
+  retryConfig,
 } from "./retry.js";
 import { ThinkingTagParser } from "./thinking-parser.js";
 import { kiroTokenTypeHeaders } from "./token-type.js";
@@ -118,6 +119,27 @@ function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
       { once: true },
     );
   });
+}
+
+function createRequestHeaderAbort(
+  callerSignal: AbortSignal | undefined,
+  timeoutMs: number,
+): {
+  signal: AbortSignal;
+  clearTimeout: () => void;
+  didTimeout: () => boolean;
+} {
+  const timeoutController = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    timeoutController.abort(new DOMException("Response headers timeout", "TimeoutError"));
+  }, timeoutMs);
+  return {
+    signal: callerSignal ? AbortSignal.any([callerSignal, timeoutController.signal]) : timeoutController.signal,
+    clearTimeout: () => clearTimeout(timer),
+    didTimeout: () => timedOut,
+  };
 }
 
 interface KiroRequest {
@@ -300,7 +322,7 @@ export function streamKiro(
         systemPrompt = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>${systemPrompt ? `\n${systemPrompt}` : ""}`;
       }
       let retryCount = 0;
-      const maxRetries = 3;
+      const maxRetries = options?.maxRetries ?? 3;
       const conversationId = options?.sessionId ?? crypto.randomUUID();
       while (retryCount <= maxRetries) {
         if (options?.signal?.aborted) throw options.signal.reason;
@@ -559,7 +581,7 @@ export function streamKiro(
           profileArn,
           agentMode: "vibe",
         };
-        let response!: Response;
+        let response: Response | undefined;
         // Reset per outer iteration — each 403 retry gets a fresh capacity budget
         let capacityRetryCount = 0;
         // Inner loop: retry capacity errors without consuming outer retry budget
@@ -579,23 +601,39 @@ export function streamKiro(
             toolResultCount: wireUimc?.toolResults?.length ?? 0,
             request,
           });
-          response = await fetch(endpoint, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Accept: "application/vnd.amazon.eventstream",
-              Authorization: `Bearer ${accessToken}`,
-              ...kiroTokenTypeHeaders(accessToken),
-              "x-amzn-codewhisperer-optout": "true",
-              "amz-sdk-invocation-id": crypto.randomUUID(),
-              "amz-sdk-request": "attempt=1; max=1",
-              "x-amzn-kiro-agent-mode": "vibe",
-              "x-amz-user-agent": ua,
-              "user-agent": ua,
-            },
-            body: JSON.stringify(request),
-            signal: options?.signal,
-          });
+          const requestAbort = createRequestHeaderAbort(
+            options?.signal,
+            options?.timeoutMs ?? retryConfig.requestHeaderTimeoutMs,
+          );
+          try {
+            response = await (options?.fetch ?? fetch)(endpoint, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: "application/vnd.amazon.eventstream",
+                Authorization: `Bearer ${accessToken}`,
+                "x-amzn-codewhisperer-optout": "true",
+                "amz-sdk-invocation-id": crypto.randomUUID(),
+                "amz-sdk-request": "attempt=1; max=1",
+                "x-amzn-kiro-agent-mode": "vibe",
+                "x-amz-user-agent": ua,
+                "user-agent": ua,
+              },
+              body: JSON.stringify(request),
+              signal: requestAbort.signal,
+            });
+            requestAbort.clearTimeout();
+          } catch (error) {
+            requestAbort.clearTimeout();
+            if (!requestAbort.didTimeout() || options?.signal?.aborted) throw error;
+            if (retryCount >= maxRetries) {
+              throw new Error("Kiro API error: response headers timeout after max retries");
+            }
+            retryCount++;
+            const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY);
+            await abortableDelay(delayMs, options?.signal);
+            break;
+          }
           if (!response.ok) {
             let errText = "";
             try {
@@ -669,6 +707,9 @@ export function streamKiro(
           }
           break; // success, break inner loop
         }
+        // Header timeout or 403 refresh: the inner loop deliberately exits
+        // without a usable response so the outer loop can rebuild and retry.
+        if (!response) continue;
         if (capacityRetryCount > 0 && response.ok) {
           logCapacityEvent(`INSUFFICIENT_MODEL_CAPACITY — succeeded after ${capacityRetryCount} retries`);
         }

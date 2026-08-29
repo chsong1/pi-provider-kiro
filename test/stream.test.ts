@@ -4026,4 +4026,48 @@ describe("Feature 9: Streaming Integration", () => {
 
     vi.unstubAllGlobals();
   });
+  it("bounds the HTTP response-header wait", async () => {
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+    });
+
+    const events = await collect(
+      streamKiro(makeModel(), makeContext(), {
+        apiKey: "tok",
+        fetch: fetchMock as typeof fetch,
+        timeoutMs: 10,
+        maxRetries: 0,
+      }),
+    );
+
+    const error = events.find((event) => event.type === "error");
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(error?.type === "error" && error.error.errorMessage).toContain("response headers timeout");
+  });
+
+  it("does not relabel caller cancellation as a header timeout", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+    });
+    setTimeout(() => controller.abort(new DOMException("cancelled", "AbortError")), 5);
+
+    const events = await collect(
+      streamKiro(makeModel(), makeContext(), {
+        apiKey: "tok",
+        fetch: fetchMock as typeof fetch,
+        signal: controller.signal,
+        timeoutMs: 1000,
+      }),
+    );
+
+    const error = events.find((event) => event.type === "error");
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(error?.type === "error" && error.error.stopReason).toBe("aborted");
+    expect(error?.type === "error" && error.error.errorMessage).not.toContain("response headers timeout");
+  });
 });
