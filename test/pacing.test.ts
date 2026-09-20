@@ -58,11 +58,53 @@ function harness(): Harness {
 
 const defaults = { ...pacingConfig };
 
+beforeEach(() => {
+  pacingConfig.enabled = true;
+});
+
 afterEach(() => {
   Object.assign(pacingConfig, defaults);
 });
 
 describe("RequestPacer", () => {
+  it("does not read or write shared state when pacing is disabled", async () => {
+    const { pacer, store, waits } = harness();
+    pacingConfig.enabled = false;
+    pacer.penalize();
+    await pacer.acquire();
+    expect(store.reads).toBe(0);
+    expect(store.writes).toBe(0);
+    expect(waits).toEqual([]);
+  });
+
+  it("cancels a queued request without waiting for a preceding reservation", async () => {
+    const store = new MemoryStore();
+    let release: (() => void) | undefined;
+    const pacer = new RequestPacer(
+      () => 1000,
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+      store,
+    );
+    pacer.penalize();
+    await pacer.acquire();
+    const preceding = pacer.acquire();
+    await Promise.resolve();
+    const controller = new AbortController();
+    const queued = pacer.acquire(controller.signal);
+    const reason = new Error("caller canceled");
+    controller.abort(reason);
+    await expect(queued).rejects.toBe(reason);
+    const writes = store.writes;
+    release?.();
+    await preceding;
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.writes).toBe(writes);
+  });
+
   it("is dormant until a rejection is observed", async () => {
     const { pacer, waits } = harness();
     await pacer.acquire();

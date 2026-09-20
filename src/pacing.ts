@@ -42,7 +42,7 @@ export const pacingConfig = {
    */
   sharedPollMs: 2_000,
   /** Set false to disable pacing entirely (retry behavior is unaffected). */
-  enabled: true,
+  enabled: false,
   /** Set false to keep pacing state process-local. */
   shared: true,
 };
@@ -115,7 +115,7 @@ function readEnvNumber(name: string): number | undefined {
 }
 
 function applyEnvOverrides(): void {
-  if (/^(0|off|false|no)$/i.test(process.env.KIRO_REQUEST_PACING ?? "")) pacingConfig.enabled = false;
+  pacingConfig.enabled = /^(1|on|true|yes)$/i.test(process.env.KIRO_REQUEST_PACING ?? "");
   if (/^(0|off|false|no)$/i.test(process.env.KIRO_PACING_SHARED ?? "")) pacingConfig.shared = false;
   const min = readEnvNumber("KIRO_PACING_MIN_MS");
   if (min !== undefined) pacingConfig.minSpacingMs = min;
@@ -134,15 +134,15 @@ applyEnvOverrides();
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(signal.reason);
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(signal.reason);
-      },
-      { once: true },
-    );
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -183,10 +183,25 @@ export class RequestPacer {
       () => undefined,
       () => undefined,
     );
-    return run;
+    if (!signal) return run;
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+      run.then(
+        () => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        },
+        (error) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+    });
   }
 
   private async reserve(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw signal.reason;
     this.adoptShared();
     this.decay();
     if (this.spacing <= 0) return;
@@ -200,6 +215,7 @@ export class RequestPacer {
 
   /** Record a rate rejection and widen spacing one step per burst. */
   penalize(): void {
+    if (!pacingConfig.enabled) return;
     this.adoptShared(true);
     const now = this.now();
     // Same burst as the last rejection: keep the quiet timer fresh, but do not

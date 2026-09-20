@@ -75,64 +75,37 @@ Or let Kiro pick automatically:
 
 Reasoning is automatically enabled for supported models. Use `/reasoning` to adjust the thinking budget.
 
+### Estimated usage
+
+Kiro reports an exact credit count for completed turns, but not a per-turn USD charge. It also currently omits the cache-read and cache-write fields modeled by its token-usage response. Both estimates are independently opt-in:
+
+```json
+{
+  "pi-provider-kiro": {
+    "usageTracking": {
+      "estimateDollarValue": true,
+      "estimateCacheUsage": true,
+      "estimatedCacheTimeout": 300000
+    }
+  }
+}
+```
+
+`estimateDollarValue` converts credits to an estimated USD-equivalent value for Pi usage dashboards. `usdPerCredit` defaults to Kiro's published add-on rate of `$0.04` per credit and may be overridden. The legacy `enabled: true` setting remains accepted as a deprecated alias for `estimateDollarValue: true`.
+
+`estimateCacheUsage` conservatively reclassifies prompt tokens repeated from the previous successful turn in the same session as `cacheRead`. The first turn, large context reductions, idle gaps beyond `estimatedCacheTimeout`, and any response carrying real wire cache counters remain untouched. The timeout defaults to five minutes; set it to `0` to disable expiry. Estimated messages include `usage.cacheEstimated: true` so audits can distinguish estimates from provider-reported values.
+
+These values are estimates, not wire truth, invoices, or confirmed marginal charges. Credits included in a subscription may have no marginal cost, and estimated cache usage does not prove that Kiro served a backend cache hit. Tracking is disabled by default, and invalid settings fail closed for the affected estimate. Pi's HTML session export currently recomputes component costs and may therefore show `$0`; cost dashboards and summaries that read `usage.cost.total` show the dollar-value estimate.
+
 ## Retry Behavior
 
-Generic transient retries such as `5xx` are handled by `pi-coding-agent` at the
-session layer.
+Generic transient retries such as HTTP `429` and `5xx` are handled by `pi-coding-agent` at the session layer.
 
-This provider keeps local recovery for Kiro-specific cases:
+This provider only keeps local recovery for Kiro-specific cases:
 - `403` auth races, where it can refresh credentials from `kiro-cli`
 - first-token / stalled-stream recovery
 - empty-stream retries
 - non-retryable Kiro body markers like `MONTHLY_REQUEST_COUNT` and `INSUFFICIENT_MODEL_CAPACITY`
-- account rate rejections (`429` / `USER_REQUEST_RATE_EXCEEDED`) — see below
-
-### Rate limiting
-
-Kiro's rate limit is scoped to the **account**, so a parallel fan-out competes
-with itself: every concurrent stream, every session, and every pi process on the
-machine draws from one budget. The provider owns this case rather than delegating
-it, because recovering well needs three things the session layer cannot do —
-honor `Retry-After`, spread simultaneous retries apart, and slow down the
-requests that have not been sent yet.
-
-- **Retry**: up to 8 attempts on a budget of its own, so a rejection never costs
-  a token-refresh or timeout retry. Delays use full jitter over a growing window
-  (1s–60s); a `Retry-After` header is taken as the floor. An exhausted budget
-  surfaces the `429` so session-level retry remains the outer safety net.
-- **Pacing**: spacing between request *starts* — never a concurrency cap, so a
-  long stream cannot block a queued one. Zero until a rejection is observed, one
-  step wider per rejection *burst* (rejections within 1s count once), decaying
-  back to zero after 30s of quiet. State lives in
-  `~/.pi/logs/kiro-pacing.json`, so a process that starts right after a
-  rejection inherits the spacing instead of bursting into the same wall.
-
-Measured on a 100-request burst against a live account: 15 rejections, 0
-surfaced errors, 100/100 completed. Letting each rejection widen spacing
-individually (instead of per burst) drove spacing to its ceiling from one
-collision and tripled wall time — 38.0s versus 13.8s for identical work.
-
-Rate-limit events are appended to `~/.pi/logs/capacity-retries.log`:
-
-```
-USER_REQUEST_RATE_EXCEEDED — retrying in 1903ms (2/8, pacing 400ms)
-```
-
-Environment overrides:
-
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `KIRO_REQUEST_PACING=off` | on | Disable pacing; retry still applies |
-| `KIRO_PACING_SHARED=off` | on | Keep pacing state process-local |
-| `KIRO_PACING_MIN_MS` | `200` | Spacing after the first rejection |
-| `KIRO_PACING_MAX_MS` | `4000` | Spacing ceiling |
-| `KIRO_PACING_DECAY_MS` | `30000` | Quiet period before relaxing one step |
-| `KIRO_PACING_COALESCE_MS` | `1000` | Window in which rejections count once |
-| `KIRO_PACING_POLL_MS` | `2000` | How often a dormant process re-reads shared state |
-| `KIRO_PACING_STATE_FILE` | `~/.pi/logs/kiro-pacing.json` | Shared state location |
-
-To reproduce load locally: `N=100 node scripts/kiro-loadtest.mjs` (reads the
-credential from pi's auth store and prints only aggregates).
 
 The reason codes this provider classifies on are published from the package
 entry point, so consumers can interpret a code without hardcoding their own copy
@@ -143,13 +116,11 @@ import {
   KIRO_REASON_CODES,
   isCapacityError,
   isNonRetryableBodyError,
-  isRateLimitError,
   isTooBigError,
 } from "pi-provider-kiro";
 
 isTooBigError(400, body); // size rejection → safe to compact and retry
 isCapacityError(body); // transient capacity → safe to retry as-is
-isRateLimitError(429, body); // account rate limit → retry after a delay
 isNonRetryableBodyError(body); // hard quota → do not retry
 ```
 
@@ -196,3 +167,17 @@ See [AGENTS.md](AGENTS.md) for detailed development guidance and [.agents/summar
 ## License
 
 MIT
+
+### Optional request pacing
+
+Set `KIRO_REQUEST_PACING=on` to space request starts after an exact
+`USER_REQUEST_RATE_EXCEEDED` response. Pacing is disabled by default. It does not
+change the provider retry budget, the 10-second retry fallback/cap, supported wait
+headers, or handling of generic 429 and 5xx responses.
+
+Opted-in processes share approximate pacing hints in `~/.pi/logs/kiro-pacing.json`.
+This is best-effort coordination across the local user's sessions, not an atomic
+account-wide rate limiter. Set `KIRO_PACING_SHARED=off` for process-local pacing.
+Spacing starts at 200 ms, grows to at most 4 seconds per rejection burst, and
+relaxes after 30 seconds without a rejection. Corrupt or unwritable state falls
+back to process-local pacing. Long-running streams do not hold a concurrency slot.
